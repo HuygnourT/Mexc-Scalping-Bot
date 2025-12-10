@@ -4,6 +4,14 @@ const https = require('https');
 // Default API host - can be overridden per request
 let MEXC_API_HOST = 'api.mexc.com';
 
+// Keep-alive agent to reuse connections (prevents socket exhaustion)
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  maxFreeSockets: 5,
+  timeout: 60000
+});
+
 function setApiHost(host) {
   MEXC_API_HOST = host;
 }
@@ -235,6 +243,7 @@ async function cancelOrder({ apiKey, apiSecret, symbol, orderId }) {
 
 function makeRequest(options, body = null) {
   return new Promise((resolve, reject) => {
+    options.agent = keepAliveAgent;  // Reuse connections
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });

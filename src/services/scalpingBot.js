@@ -16,6 +16,9 @@ class ScalpingBot {
     this.startTime = null;
     this.endTime = null;
     this.runHistory = [];  // Store all session history
+    this.loopCount = 0;
+    this.consecutiveErrors = 0;  // Track consecutive errors
+    this.lastErrorTime = 0;
     this.stats = {
       totalBuyOrdersCreated: 0,
       totalBuyOrdersFilled: 0,
@@ -56,10 +59,44 @@ class ScalpingBot {
     this.config.sellAllOnStop = newConfig.sellAllOnStop;
     
     this.log('⚙️ Configuration updated while running', 'warning');
-    this.log(`Tick Size: ${oldConfig.tickSize} → ${this.config.tickSize}`, 'info');
-    this.log(`Max Buy Orders: ${oldConfig.maxBuyOrders} → ${this.config.maxBuyOrders}`, 'info');
-    this.log(`Order Qty: ${oldConfig.orderQty} → ${this.config.orderQty}`, 'info');
-    this.log(`TP Ticks: ${oldConfig.tpTicks} → ${this.config.tpTicks}`, 'info');
+    
+    // Log only changed values
+    if (oldConfig.tickSize !== this.config.tickSize) {
+      this.log(`Tick Size: ${oldConfig.tickSize} → ${this.config.tickSize}`, 'info');
+    }
+    if (oldConfig.maxBuyOrders !== this.config.maxBuyOrders) {
+      this.log(`Max Buy Orders: ${oldConfig.maxBuyOrders} → ${this.config.maxBuyOrders}`, 'info');
+    }
+    if (oldConfig.offsetTicks !== this.config.offsetTicks) {
+      this.log(`Offset Ticks: ${oldConfig.offsetTicks} → ${this.config.offsetTicks}`, 'info');
+    }
+    if (oldConfig.layerStepTicks !== this.config.layerStepTicks) {
+      this.log(`Layer Step Ticks: ${oldConfig.layerStepTicks} → ${this.config.layerStepTicks}`, 'info');
+    }
+    if (oldConfig.buyTTL !== this.config.buyTTL) {
+      this.log(`Buy TTL: ${oldConfig.buyTTL}s → ${this.config.buyTTL}s`, 'info');
+    }
+    if (oldConfig.repriceTicks !== this.config.repriceTicks) {
+      this.log(`Reprice Ticks: ${oldConfig.repriceTicks} → ${this.config.repriceTicks}`, 'info');
+    }
+    if (oldConfig.tpTicks !== this.config.tpTicks) {
+      this.log(`TP Ticks: ${oldConfig.tpTicks} → ${this.config.tpTicks} (only new TPs)`, 'info');
+    }
+    if (oldConfig.maxSellTPOrders !== this.config.maxSellTPOrders) {
+      this.log(`Max TP Orders: ${oldConfig.maxSellTPOrders} → ${this.config.maxSellTPOrders}`, 'info');
+    }
+    if (oldConfig.orderQty !== this.config.orderQty) {
+      this.log(`Order Qty: ${oldConfig.orderQty} → ${this.config.orderQty}`, 'info');
+    }
+    if (oldConfig.loopInterval !== this.config.loopInterval) {
+      this.log(`Loop Interval: ${oldConfig.loopInterval}ms → ${this.config.loopInterval}ms`, 'info');
+    }
+    if (oldConfig.waitAfterBuyFill !== this.config.waitAfterBuyFill) {
+      this.log(`Wait After Fill: ${oldConfig.waitAfterBuyFill}ms → ${this.config.waitAfterBuyFill}ms`, 'info');
+    }
+    if (oldConfig.sellAllOnStop !== this.config.sellAllOnStop) {
+      this.log(`Sell All On Stop: ${oldConfig.sellAllOnStop} → ${this.config.sellAllOnStop}`, 'info');
+    }
     
     return { success: true, message: 'Configuration updated' };
   }
@@ -78,6 +115,9 @@ class ScalpingBot {
       pendingPositions: []
     };
     this.logs = [];
+    this.loopCount = 0;
+    this.consecutiveErrors = 0;
+    this.lastErrorTime = 0;
     this.isWaitingForMarketSell = false;
     this.pendingMarketSell = null;
     this.pendingNewTP = null;
@@ -393,16 +433,36 @@ class ScalpingBot {
       
       const orderbook = await this.fetchOrderbook();
       if (orderbook) {
-        this.log(`Orderbook: Bid=${orderbook.bestBid}, Ask=${orderbook.bestAsk}`, 'info');
+        // Reset error counter on success
+        this.consecutiveErrors = 0;
+        
+        // Only log orderbook every 10 loops to reduce spam
+        this.loopCount++;
+        if (this.loopCount % 10 === 0) {
+          this.log(`Orderbook: Bid=${orderbook.bestBid}, Ask=${orderbook.bestAsk}`, 'info');
+        }
 
         if (!this.isPaused && !this.isWaitingForMarketSell) {
           await this.updateBuyOrders(orderbook.bestBid);
           await this.createBuyOrders(orderbook.bestBid);
         }
         await this.updateSellTPOrders();
+      } else {
+        // Orderbook fetch failed
+        this.consecutiveErrors++;
       }
     } catch (error) {
-      this.log(`Loop error: ${error.message}`, 'error');
+      this.consecutiveErrors++;
+      
+      // Only log error once per 10 consecutive errors to prevent log spam
+      if (this.consecutiveErrors <= 3 || this.consecutiveErrors % 10 === 0) {
+        this.log(`Loop error (${this.consecutiveErrors}x): ${error.message}`, 'error');
+      }
+      
+      // If too many errors, wait longer before retry
+      if (this.consecutiveErrors >= 10) {
+        await this.sleep(5000);  // Wait 5s on repeated errors
+      }
     }
 
     if (this.isRunning) {
