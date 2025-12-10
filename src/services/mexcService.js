@@ -22,7 +22,7 @@ function getApiHost() {
 
 async function createOrder({ apiKey, apiSecret, symbol, side, orderType, qty, price }) {
   const timestamp = Date.now().toString();
-  const recvWindow = '5000';
+  const recvWindow = '60000';
 
   let params = {
     symbol: symbol,
