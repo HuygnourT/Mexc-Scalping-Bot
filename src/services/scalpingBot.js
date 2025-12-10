@@ -13,6 +13,9 @@ class ScalpingBot {
     this.pendingMarketSell = null;
     this.pendingNewTP = null;
     this.logs = [];
+    this.startTime = null;
+    this.endTime = null;
+    this.runHistory = [];  // Store all session history
     this.stats = {
       totalBuyOrdersCreated: 0,
       totalBuyOrdersFilled: 0,
@@ -21,6 +24,7 @@ class ScalpingBot {
       totalSellOrdersFilled: 0,
       totalSellOrdersCanceled: 0,
       realProfit: 0,
+      marketSellProfit: 0,  // Track market sell profit separately
       totalFees: 0,
       pendingPositions: []
     };
@@ -33,6 +37,33 @@ class ScalpingBot {
     this.log(`Symbol: ${config.symbol}, Tick Size: ${config.tickSize}`, 'info');
   }
 
+  // Update config while running
+  updateConfig(newConfig) {
+    const oldConfig = { ...this.config };
+    
+    // Update allowed parameters (not apiKey/apiSecret/symbol while running)
+    this.config.tickSize = newConfig.tickSize;
+    this.config.maxBuyOrders = newConfig.maxBuyOrders;
+    this.config.offsetTicks = newConfig.offsetTicks;
+    this.config.layerStepTicks = newConfig.layerStepTicks;
+    this.config.buyTTL = newConfig.buyTTL;
+    this.config.repriceTicks = newConfig.repriceTicks;
+    this.config.tpTicks = newConfig.tpTicks;
+    this.config.maxSellTPOrders = newConfig.maxSellTPOrders;
+    this.config.orderQty = newConfig.orderQty;
+    this.config.loopInterval = newConfig.loopInterval;
+    this.config.waitAfterBuyFill = newConfig.waitAfterBuyFill;
+    this.config.sellAllOnStop = newConfig.sellAllOnStop;
+    
+    this.log('⚙️ Configuration updated while running', 'warning');
+    this.log(`Tick Size: ${oldConfig.tickSize} → ${this.config.tickSize}`, 'info');
+    this.log(`Max Buy Orders: ${oldConfig.maxBuyOrders} → ${this.config.maxBuyOrders}`, 'info');
+    this.log(`Order Qty: ${oldConfig.orderQty} → ${this.config.orderQty}`, 'info');
+    this.log(`TP Ticks: ${oldConfig.tpTicks} → ${this.config.tpTicks}`, 'info');
+    
+    return { success: true, message: 'Configuration updated' };
+  }
+
   resetStats() {
     this.stats = {
       totalBuyOrdersCreated: 0,
@@ -42,6 +73,7 @@ class ScalpingBot {
       totalSellOrdersFilled: 0,
       totalSellOrdersCanceled: 0,
       realProfit: 0,
+      marketSellProfit: 0,
       totalFees: 0,
       pendingPositions: []
     };
@@ -49,6 +81,8 @@ class ScalpingBot {
     this.isWaitingForMarketSell = false;
     this.pendingMarketSell = null;
     this.pendingNewTP = null;
+    this.startTime = null;
+    this.endTime = null;
   }
 
   getStatus() {
@@ -63,8 +97,34 @@ class ScalpingBot {
       config: this.config,
       estimatedProfit: this.calculateEstimatedProfit(),
       avgBuyPrice: this.calculateAvgBuyPrice(),
-      totalPendingQty: this.calculateTotalPendingQty()
+      totalPendingQty: this.calculateTotalPendingQty(),
+      startTime: this.startTime,
+      endTime: this.endTime,
+      runHistory: this.runHistory
     };
+  }
+
+  getRunHistory() {
+    return this.runHistory;
+  }
+
+  clearHistory() {
+    this.runHistory = [];
+    return { success: true, message: 'History cleared' };
+  }
+
+  formatDuration(ms) {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`;
+    } else {
+      return `${seconds}s`;
+    }
   }
 
   calculateEstimatedProfit() {
@@ -96,6 +156,8 @@ class ScalpingBot {
     }
     this.isRunning = true;
     this.isPaused = false;
+    this.startTime = new Date().toISOString();
+    this.endTime = null;
     this.log('🚀 Bot started', 'success');
     this.runMainLoop();
     return { success: true, message: 'Bot started' };
@@ -121,6 +183,9 @@ class ScalpingBot {
     }
     this.activeBuyOrders = [];
 
+    // Track market sell profit separately
+    this.stats.marketSellProfit = 0;
+    
     if (this.config.sellAllOnStop && this.activeSellTPOrders.length > 0) {
       this.log('💰 Sell All On Stop - Selling at market...', 'warning');
       await this.sellAllAtMarket();
@@ -128,8 +193,39 @@ class ScalpingBot {
       await this.cancelAllTPOrders();
     }
 
+    this.endTime = new Date().toISOString();
     this.log('⏹️ Bot stopped', 'warning');
-    return { success: true, message: 'Bot stopped' };
+    
+    // Save to run history
+    const runDuration = new Date(this.endTime) - new Date(this.startTime);
+    const historyEntry = {
+      id: Date.now(),
+      startTime: this.startTime,
+      endTime: this.endTime,
+      duration: this.formatDuration(runDuration),
+      durationMs: runDuration,
+      symbol: this.config.symbol,
+      totalBuyFilled: this.stats.totalBuyOrdersFilled,
+      totalSellFilled: this.stats.totalSellOrdersFilled,
+      realProfit: this.stats.realProfit,
+      marketSellProfit: this.stats.marketSellProfit,
+      totalProfit: this.stats.realProfit,
+      config: {
+        tickSize: this.config.tickSize,
+        orderQty: this.config.orderQty,
+        tpTicks: this.config.tpTicks,
+        maxBuyOrders: this.config.maxBuyOrders
+      }
+    };
+    
+    this.runHistory.unshift(historyEntry);  // Add to beginning
+    
+    // Keep only last 50 entries
+    if (this.runHistory.length > 50) {
+      this.runHistory = this.runHistory.slice(0, 50);
+    }
+    
+    return { success: true, message: 'Bot stopped', history: historyEntry };
   }
 
   async pause() {
@@ -266,6 +362,7 @@ class ScalpingBot {
         if (sellOrderId) {
           const profitLoss = (bestBid - order.buyPrice) * order.qty;
           this.stats.realProfit += profitLoss;
+          this.stats.marketSellProfit += profitLoss;  // Track separately
           this.stats.totalSellOrdersFilled++;
           this.log(`💰 Market sold ${order.qty} @ ~${bestBid}, P/L: ${profitLoss.toFixed(6)} USDT`, profitLoss >= 0 ? 'success' : 'error');
         }
@@ -274,6 +371,7 @@ class ScalpingBot {
       }
     }
     this.activeSellTPOrders = [];
+    this.stats.pendingPositions = [];
   }
 
   async cancelAllTPOrders() {

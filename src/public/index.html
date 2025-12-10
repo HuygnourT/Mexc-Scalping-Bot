@@ -17,7 +17,7 @@
 
         <div class="config-section">
             <div class="config-title">🔑 API Configuration</div>
-
+            
             <div class="input-group">
                 <label>API Host</label>
                 <select id="apiHost">
@@ -114,7 +114,7 @@
                 <button class="pause-scalp-btn" id="pauseScalpBtn" style="display: none;">⏸️ Pause</button>
                 <button class="resume-scalp-btn" id="resumeScalpBtn" style="display: none;">▶️ Resume</button>
                 <button class="stop-scalp-btn" id="stopScalpBtn" style="display: none;">⏹️ Stop All</button>
-                <button class="test-order-btn" id="testOrderBtn">🧪 Test Order</button>
+                <button class="update-config-btn" id="updateConfigBtn" style="display: none;">🔄 Update Config</button>
                 <button class="clear-stats-btn" id="clearStatsBtn">🗑️ Clear</button>
             </div>
 
@@ -127,6 +127,17 @@
                 <div class="logs-content" id="logsContent">
                     <div class="log-item info">Bot ready. Configure parameters and click Start.</div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Run History Section -->
+        <div class="history-section">
+            <div class="history-header">
+                <h3>📊 Run History</h3>
+                <button class="clear-history-btn" id="clearHistoryBtn">🗑️ Clear History</button>
+            </div>
+            <div class="history-content" id="historyContent">
+                <div class="no-history">No run history yet. Start the bot to record sessions.</div>
             </div>
         </div>
     </div>

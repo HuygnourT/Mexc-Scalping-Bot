@@ -79,6 +79,27 @@ app.post('/api/bot/clear-stats', (req, res) => {
   res.json({ success: true, message: 'Stats cleared' });
 });
 
+// Update config while running
+app.post('/api/bot/update-config', (req, res) => {
+  if (!bot.isRunning) {
+    return res.json({ success: false, message: 'Bot is not running' });
+  }
+  const config = req.body;
+  const result = bot.updateConfig(config);
+  res.json(result);
+});
+
+// Get run history
+app.get('/api/bot/history', (req, res) => {
+  res.json({ success: true, data: bot.getRunHistory() });
+});
+
+// Clear run history
+app.post('/api/bot/clear-history', (req, res) => {
+  const result = bot.clearHistory();
+  res.json(result);
+});
+
 // Get wallet balance
 app.post('/api/wallet/balance', async (req, res) => {
   try {

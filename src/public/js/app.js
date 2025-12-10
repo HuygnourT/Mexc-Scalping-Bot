@@ -1,14 +1,6 @@
 // MEXC Scalping Bot - Frontend UI
 // This file only handles UI interactions and API calls to the server
 
-const apiHostSelect = document.getElementById('apiHost');
-
-// Add event listener
-apiHostSelect.addEventListener('change', changeApiHost);
-
-// Load current API host
-loadCurrentHost();
-
 let statusInterval = null;
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -19,9 +11,11 @@ document.addEventListener('DOMContentLoaded', function() {
     const stopBtn = document.getElementById('stopScalpBtn');
     const pauseBtn = document.getElementById('pauseScalpBtn');
     const resumeBtn = document.getElementById('resumeScalpBtn');
-    const testOrderBtn = document.getElementById('testOrderBtn');
+    const updateConfigBtn = document.getElementById('updateConfigBtn');
     const clearStatsBtn = document.getElementById('clearStatsBtn');
     const balanceBtn = document.getElementById('balanceBtn');
+    const apiHostSelect = document.getElementById('apiHost');
+    const clearHistoryBtn = document.getElementById('clearHistoryBtn');
 
     // Event listeners
     balanceBtn.addEventListener('click', checkBalance);
@@ -29,12 +23,49 @@ document.addEventListener('DOMContentLoaded', function() {
     stopBtn.addEventListener('click', stopBot);
     pauseBtn.addEventListener('click', pauseBot);
     resumeBtn.addEventListener('click', resumeBot);
-    testOrderBtn.addEventListener('click', testOrder);
+    updateConfigBtn.addEventListener('click', updateConfig);
     clearStatsBtn.addEventListener('click', clearStats);
+    apiHostSelect.addEventListener('change', changeApiHost);
+    clearHistoryBtn.addEventListener('click', clearHistory);
 
+    // Load current API host
+    loadCurrentHost();
+    
+    // Load history
+    loadHistory();
+    
     // Initial status check
     fetchStatus();
 });
+
+async function loadCurrentHost() {
+    try {
+        const response = await fetch('/api/get-host');
+        const data = await response.json();
+        if (data.success) {
+            document.getElementById('apiHost').value = data.host;
+        }
+    } catch (error) {
+        console.error('Failed to load API host:', error);
+    }
+}
+
+async function changeApiHost() {
+    const host = document.getElementById('apiHost').value;
+    try {
+        const response = await fetch('/api/set-host', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host })
+        });
+        const data = await response.json();
+        if (data.success) {
+            console.log('API host changed to:', host);
+        }
+    } catch (error) {
+        alert('Failed to change API host: ' + error.message);
+    }
+}
 
 function getConfig() {
     return {
@@ -153,6 +184,7 @@ async function stopBot() {
             updateButtons(false, false);
             stopStatusPolling();
             fetchStatus();
+            loadHistory();  // Refresh history after stop
         }
     } catch (error) {
         alert('Error: ' + error.message);
@@ -185,19 +217,20 @@ async function resumeBot() {
     }
 }
 
-async function testOrder() {
+async function updateConfig() {
     const config = getConfig();
-    if (!validateConfig(config)) return;
-    
     try {
-        const response = await fetch('/api/bot/test', {
+        const response = await fetch('/api/bot/update-config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(config)
         });
         const data = await response.json();
-        alert(data.message);
-        fetchStatus();
+        if (data.success) {
+            alert('Configuration updated successfully!');
+        } else {
+            alert('Failed to update: ' + data.message);
+        }
     } catch (error) {
         alert('Error: ' + error.message);
     }
@@ -217,18 +250,99 @@ async function clearStats() {
     }
 }
 
+async function loadHistory() {
+    try {
+        const response = await fetch('/api/bot/history');
+        const data = await response.json();
+        if (data.success) {
+            renderHistory(data.data);
+        }
+    } catch (error) {
+        console.error('Failed to load history:', error);
+    }
+}
+
+async function clearHistory() {
+    if (!confirm('Are you sure you want to clear all run history?')) return;
+    
+    try {
+        const response = await fetch('/api/bot/clear-history', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            loadHistory();
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+function renderHistory(history) {
+    const historyContent = document.getElementById('historyContent');
+    
+    if (!history || history.length === 0) {
+        historyContent.innerHTML = '<div class="no-history">No run history yet. Start the bot to record sessions.</div>';
+        return;
+    }
+    
+    historyContent.innerHTML = history.map(item => {
+        const startDate = new Date(item.startTime);
+        const endDate = new Date(item.endTime);
+        const profitClass = item.totalProfit >= 0 ? 'positive' : 'negative';
+        const marketSellClass = item.marketSellProfit >= 0 ? 'positive' : 'negative';
+        
+        return `
+            <div class="history-item">
+                <div class="history-item-header">
+                    <span class="history-symbol">${item.symbol}</span>
+                    <span class="history-duration">⏱️ ${item.duration}</span>
+                </div>
+                <div class="history-times">
+                    <span>🟢 Start: ${startDate.toLocaleString()}</span>
+                    <span>🔴 End: ${endDate.toLocaleString()}</span>
+                </div>
+                <div class="history-stats">
+                    <div class="history-stat">
+                        <div class="history-stat-label">Buy Filled</div>
+                        <div class="history-stat-value">${item.totalBuyFilled}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-label">TP Filled</div>
+                        <div class="history-stat-value">${item.totalSellFilled}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-label">Market Sell P/L</div>
+                        <div class="history-stat-value ${marketSellClass}">${item.marketSellProfit >= 0 ? '+' : ''}${item.marketSellProfit.toFixed(6)}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-label">Total Profit</div>
+                        <div class="history-stat-value ${profitClass}">${item.totalProfit >= 0 ? '+' : ''}${item.totalProfit.toFixed(6)}</div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
 function updateButtons(isRunning, isPaused) {
     const startBtn = document.getElementById('startScalpBtn');
     const stopBtn = document.getElementById('stopScalpBtn');
     const pauseBtn = document.getElementById('pauseScalpBtn');
     const resumeBtn = document.getElementById('resumeScalpBtn');
+    const updateConfigBtn = document.getElementById('updateConfigBtn');
     const clearStatsBtn = document.getElementById('clearStatsBtn');
     
     startBtn.style.display = isRunning ? 'none' : 'block';
     stopBtn.style.display = isRunning ? 'block' : 'none';
     pauseBtn.style.display = isRunning && !isPaused ? 'block' : 'none';
     resumeBtn.style.display = isRunning && isPaused ? 'block' : 'none';
+    updateConfigBtn.style.display = isRunning ? 'block' : 'none';
     clearStatsBtn.disabled = isRunning;
+    
+    // Disable config inputs while running (except allowed ones)
+    const configInputs = document.querySelectorAll('#apiKey, #apiSecret, #symbol, #apiHost');
+    configInputs.forEach(input => {
+        input.disabled = isRunning;
+    });
 }
 
 function startStatusPolling() {
@@ -405,34 +519,5 @@ function renderStatus(status) {
                 </div>
             </div>
         `;
-    }
-}
-
-async function loadCurrentHost() {
-    try {
-        const response = await fetch('/api/get-host');
-        const data = await response.json();
-        if (data.success) {
-            document.getElementById('apiHost').value = data.host;
-        }
-    } catch (error) {
-        console.error('Failed to load API host:', error);
-    }
-}
-
-async function changeApiHost() {
-    const host = document.getElementById('apiHost').value;
-    try {
-        const response = await fetch('/api/set-host', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host })
-        });
-        const data = await response.json();
-        if (data.success) {
-            console.log('API host changed to:', host);
-        }
-    } catch (error) {
-        alert('Failed to change API host: ' + error.message);
     }
 }
