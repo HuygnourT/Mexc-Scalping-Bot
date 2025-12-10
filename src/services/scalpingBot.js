@@ -433,36 +433,16 @@ class ScalpingBot {
       
       const orderbook = await this.fetchOrderbook();
       if (orderbook) {
-        // Reset error counter on success
-        this.consecutiveErrors = 0;
-        
-        // Only log orderbook every 10 loops to reduce spam
-        this.loopCount++;
-        if (this.loopCount % 10 === 0) {
-          this.log(`Orderbook: Bid=${orderbook.bestBid}, Ask=${orderbook.bestAsk}`, 'info');
-        }
-
+        this.log(`Orderbook: Bid=${orderbook.bestBid}, Ask=${orderbook.bestAsk}`, 'info');
         if (!this.isPaused && !this.isWaitingForMarketSell) {
           await this.updateBuyOrders(orderbook.bestBid);
           await this.createBuyOrders(orderbook.bestBid);
         }
         await this.updateSellTPOrders();
-      } else {
-        // Orderbook fetch failed
-        this.consecutiveErrors++;
       }
+      
     } catch (error) {
-      this.consecutiveErrors++;
-      
-      // Only log error once per 10 consecutive errors to prevent log spam
-      if (this.consecutiveErrors <= 3 || this.consecutiveErrors % 10 === 0) {
-        this.log(`Loop error (${this.consecutiveErrors}x): ${error.message}`, 'error');
-      }
-      
-      // If too many errors, wait longer before retry
-      if (this.consecutiveErrors >= 10) {
-        await this.sleep(5000);  // Wait 5s on repeated errors
-      }
+      this.log(`Loop error: ${error.message}`, 'error');
     }
 
     if (this.isRunning) {
