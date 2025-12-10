@@ -1,6 +1,14 @@
 // MEXC Scalping Bot - Frontend UI
 // This file only handles UI interactions and API calls to the server
 
+const apiHostSelect = document.getElementById('apiHost');
+
+// Add event listener
+apiHostSelect.addEventListener('change', changeApiHost);
+
+// Load current API host
+loadCurrentHost();
+
 let statusInterval = null;
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -397,5 +405,34 @@ function renderStatus(status) {
                 </div>
             </div>
         `;
+    }
+}
+
+async function loadCurrentHost() {
+    try {
+        const response = await fetch('/api/get-host');
+        const data = await response.json();
+        if (data.success) {
+            document.getElementById('apiHost').value = data.host;
+        }
+    } catch (error) {
+        console.error('Failed to load API host:', error);
+    }
+}
+
+async function changeApiHost() {
+    const host = document.getElementById('apiHost').value;
+    try {
+        const response = await fetch('/api/set-host', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host })
+        });
+        const data = await response.json();
+        if (data.success) {
+            console.log('API host changed to:', host);
+        }
+    } catch (error) {
+        alert('Failed to change API host: ' + error.message);
     }
 }

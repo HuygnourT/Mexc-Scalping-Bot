@@ -93,6 +93,21 @@ app.post('/api/wallet/balance', async (req, res) => {
   }
 });
 
+// Set API host
+app.post('/api/set-host', (req, res) => {
+  const { host } = req.body;
+  if (!host) {
+    return res.status(400).json({ success: false, message: 'Missing host' });
+  }
+  mexcService.setApiHost(host);
+  res.json({ success: true, message: `API host set to ${host}`, host });
+});
+
+// Get current API host
+app.get('/api/get-host', (req, res) => {
+  res.json({ success: true, host: mexcService.getApiHost() });
+});
+
 // Get orderbook
 app.post('/api/orderbook', async (req, res) => {
   try {

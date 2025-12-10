@@ -1,7 +1,16 @@
 const crypto = require('../utils/crypto');
 const https = require('https');
 
-const MEXC_API_HOST = 'api.mexc.com';
+// Default API host - can be overridden per request
+let MEXC_API_HOST = 'api.mexc.com';
+
+function setApiHost(host) {
+  MEXC_API_HOST = host;
+}
+
+function getApiHost() {
+  return MEXC_API_HOST;
+}
 
 async function createOrder({ apiKey, apiSecret, symbol, side, orderType, qty, price }) {
   const timestamp = Date.now().toString();
@@ -258,5 +267,7 @@ module.exports = {
   getWalletBalance,
   getOrderbook,
   getOrderStatus,
-  cancelOrder
+  cancelOrder,
+  setApiHost,
+  getApiHost
 };
