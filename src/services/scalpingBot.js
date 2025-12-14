@@ -17,8 +17,6 @@ class ScalpingBot {
     this.endTime = null;
     this.runHistory = [];  // Store all session history
     this.loopCount = 0;
-    this.consecutiveErrors = 0;  // Track consecutive errors
-    this.lastErrorTime = 0;
     this.stats = {
       totalBuyOrdersCreated: 0,
       totalBuyOrdersFilled: 0,
@@ -117,12 +115,14 @@ class ScalpingBot {
     this.logs = [];
     this.loopCount = 0;
     this.consecutiveErrors = 0;
-    this.lastErrorTime = 0;
     this.isWaitingForMarketSell = false;
     this.pendingMarketSell = null;
     this.pendingNewTP = null;
     this.startTime = null;
     this.endTime = null;
+    this.lastBuyFillTime = 0;  // Reset lastBuyFillTime
+    this.activeBuyOrders = [];
+    this.activeSellTPOrders = [];
   }
 
   getStatus() {
@@ -189,6 +189,80 @@ class ScalpingBot {
     return this.stats.pendingPositions.reduce((sum, p) => sum + p.qty, 0);
   }
 
+  async loadExistingSellOrders() {
+    this.log('📥 Loading existing sell orders from MEXC...', 'info');
+    
+    try {
+      const result = await mexcService.getOpenOrders({
+        apiKey: this.config.apiKey,
+        apiSecret: this.config.apiSecret,
+        symbol: this.config.symbol
+      });
+
+      if (!result.success) {
+        this.log(`❌ Failed to load existing orders: ${result.message}`, 'error');
+        return { success: false, message: result.message };
+      }
+
+      const openOrders = result.data || [];
+      
+      // Filter only SELL orders with LIMIT type (these are our TP orders)
+      const sellOrders = openOrders.filter(order => 
+        order.side === 'SELL' && order.type === 'LIMIT'
+      );
+
+      if (sellOrders.length === 0) {
+        this.log('ℹ️ No existing sell orders found', 'info');
+        return { success: true, count: 0 };
+      }
+
+      this.log(`📋 Found ${sellOrders.length} existing sell order(s)`, 'info');
+
+      // Get current orderbook to estimate buy price (we don't know exact buy price)
+      const orderbook = await this.fetchOrderbook();
+      const currentBid = orderbook ? orderbook.bestBid : 0;
+
+      for (const order of sellOrders) {
+        const sellPrice = parseFloat(order.price);
+        const qty = parseFloat(order.origQty) - parseFloat(order.executedQty || 0);
+        
+        if (qty <= 0) continue; // Skip fully filled orders
+
+        // Estimate buy price: sellPrice - (tpTicks * tickSize)
+        // This is an approximation since we don't know the actual buy price
+        const estimatedBuyPrice = this.roundToTick(sellPrice - (this.config.tpTicks * this.config.tickSize));
+        
+        // Add to active sell TP orders
+        this.activeSellTPOrders.push({
+          orderId: order.orderId,
+          price: sellPrice,
+          qty: qty,
+          buyPrice: estimatedBuyPrice,  // Estimated - not exact
+          timestamp: order.time || Date.now(),
+          isExisting: true  // Mark as loaded from exchange
+        });
+
+        // Also add to pending positions
+        this.stats.pendingPositions.push({
+          orderId: order.orderId,
+          buyPrice: estimatedBuyPrice,
+          qty: qty,
+          sellPrice: sellPrice
+        });
+
+        this.log(`✅ Loaded SELL order: ${order.orderId} @ ${sellPrice} qty: ${qty}`, 'success');
+      }
+
+      this.log(`📊 Total active TP orders after loading: ${this.activeSellTPOrders.length}`, 'info');
+      
+      return { success: true, count: sellOrders.length };
+
+    } catch (error) {
+      this.log(`❌ Error loading existing orders: ${error.message}`, 'error');
+      return { success: false, message: error.message };
+    }
+  }
+
   async start() {
     if (this.isRunning) {
       this.log('Bot is already running', 'warning');
@@ -199,6 +273,13 @@ class ScalpingBot {
     this.startTime = new Date().toISOString();
     this.endTime = null;
     this.log('🚀 Bot started', 'success');
+    
+    // Load existing sell orders before starting the main loop
+    const loadResult = await this.loadExistingSellOrders();
+    if (loadResult.count > 0) {
+      this.log(`📥 Loaded ${loadResult.count} existing sell order(s) from MEXC`, 'success');
+    }
+    
     this.runMainLoop();
     return { success: true, message: 'Bot started' };
   }

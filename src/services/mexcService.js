@@ -241,6 +241,61 @@ async function cancelOrder({ apiKey, apiSecret, symbol, orderId }) {
   });
 }
 
+async function getOpenOrders({ apiKey, apiSecret, symbol }) {
+  const timestamp = Date.now().toString();
+  const recvWindow = '5000';
+
+  const queryString = `recvWindow=${recvWindow}&symbol=${symbol}&timestamp=${timestamp}`;
+  const signature = crypto.createSignature(queryString, apiSecret);
+  const signedQueryString = `${queryString}&signature=${signature}`;
+
+  const options = {
+    hostname: MEXC_API_HOST,
+    path: `/api/v3/openOrders?${signedQueryString}`,
+    method: 'GET',
+    headers: {
+      'X-MEXC-APIKEY': apiKey
+    }
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          // Response is an array of orders
+          if (Array.isArray(response)) {
+            resolve({
+              success: true,
+              data: response.map(order => ({
+                orderId: order.orderId,
+                symbol: order.symbol,
+                side: order.side,
+                type: order.type,
+                price: order.price,
+                origQty: order.origQty,
+                executedQty: order.executedQty,
+                status: order.status,
+                time: order.time
+              }))
+            });
+          } else if (response.code) {
+            resolve({ success: false, message: response.msg || 'Failed to get open orders', code: response.code });
+          } else {
+            resolve({ success: true, data: [] });
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on('error', (error) => { reject(error); });
+    req.end();
+  });
+}
+
 function makeRequest(options, body = null) {
   return new Promise((resolve, reject) => {
     options.agent = keepAliveAgent;  // Reuse connections
@@ -277,6 +332,7 @@ module.exports = {
   getOrderbook,
   getOrderStatus,
   cancelOrder,
+  getOpenOrders,
   setApiHost,
   getApiHost
 };
