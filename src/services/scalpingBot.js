@@ -229,8 +229,6 @@ class ScalpingBot {
     if (this.config.sellAllOnStop && this.activeSellTPOrders.length > 0) {
       this.log('💰 Sell All On Stop - Selling at market...', 'warning');
       await this.sellAllAtMarket();
-    } else {
-      await this.cancelAllTPOrders();
     }
 
     this.endTime = new Date().toISOString();
@@ -484,6 +482,7 @@ class ScalpingBot {
         continue;
       }
 
+      // Check TTL expiry
       if (age >= this.config.buyTTL) {
         this.log(`Order ${order.orderId} expired`, 'warning');
         await this.cancelOrder(order.orderId);
@@ -514,6 +513,13 @@ class ScalpingBot {
     const needed = this.config.maxBuyOrders - this.activeBuyOrders.length;
     if (needed <= 0) return;
 
+    // Check if TP orders reached maximum - stop creating new buys
+    if (this.activeBuyOrders.length + this.activeSellTPOrders.length >= this.config.maxSellTPOrders) {
+      this.log(`🛑 MAX TP REACHED (${this.activeSellTPOrders.length}/${this.config.maxSellTPOrders}) - Not creating new buys`, 'warning');
+      return;
+    }
+
+    // Check wait after buy fill
     if (this.config.waitAfterBuyFill > 0 && this.lastBuyFillTime > 0) {
       const timeSince = Date.now() - this.lastBuyFillTime;
       if (timeSince < this.config.waitAfterBuyFill) {
@@ -581,7 +587,6 @@ class ScalpingBot {
         this.isWaitingForMarketSell = false;
         this.pendingNewTP = null;
       }
-      return;
     }
 
     const tpPrice = this.roundToTick(buyPrice + (this.config.tpTicks * this.config.tickSize));
