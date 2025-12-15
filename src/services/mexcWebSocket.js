@@ -190,6 +190,20 @@ class MexcWebSocket {
     console.log('[WS] Subscribed to order & deal channels');
   }
 
+  // Extract orderId from clientId
+  // MEXC format: "C02__123456789" → "123456789"
+  extractOrderId(clientId) {
+    if (!clientId) return '';
+    
+    // If contains "__", extract the part after it
+    if (clientId.includes('__')) {
+      return clientId.split('__')[1] || clientId;
+    }
+    
+    // Otherwise return as-is
+    return clientId;
+  }
+
   // Handle incoming WebSocket messages
   handleMessage(data) {
     try {
@@ -198,9 +212,14 @@ class MexcWebSocket {
       // Order update
       if (message.channel === 'spot@private.orders.v3.api.pb' && message.privateOrders) {
         const order = message.privateOrders;
+        
+        // Extract orderId from clientId (e.g., "C02__123456789" → "123456789")
+        const orderId = this.extractOrderId(order.clientId);
+        
         const orderData = {
           symbol: message.symbol,
-          orderId: order.clientId,
+          orderId: orderId,
+          clientOrderId: order.clientId,
           price: parseFloat(order.price || 0),
           quantity: parseFloat(order.quantity || 0),
           avgPrice: parseFloat(order.avgPrice || 0),
@@ -214,6 +233,8 @@ class MexcWebSocket {
           timestamp: message.sendTime
         };
 
+        console.log(`[WS] Order update: ${orderData.symbol} orderId=${orderData.orderId} status=${orderData.status} tradeType=${orderData.tradeType}`);
+
         if (this.onOrderUpdate) {
           this.onOrderUpdate(orderData);
         }
@@ -222,9 +243,14 @@ class MexcWebSocket {
       // Deal/Trade update
       if (message.channel === 'spot@private.deals.v3.api.pb' && message.privateDeals) {
         const deal = message.privateDeals;
+        
+        // Extract orderId from deal.orderId as well
+        const orderId = this.extractOrderId(deal.orderId);
+        
         const dealData = {
           symbol: message.symbol,
-          orderId: deal.orderId,
+          orderId: orderId,
+          originalOrderId: deal.orderId,
           tradeId: deal.tradeId,
           price: parseFloat(deal.price || 0),
           quantity: parseFloat(deal.quantity || 0),
