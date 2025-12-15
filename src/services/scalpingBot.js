@@ -84,6 +84,8 @@ class ScalpingBot {
     this.endTime = null;
     this.activeBuyOrders = [];
     this.activeSellTPOrders = [];
+    this.pendingTPQueue = [];
+    this.isProcessingTPQueue = false;
   }
 
   getStatus() {
@@ -214,16 +216,14 @@ class ScalpingBot {
     // Only process orders for our symbol
     if (orderData.symbol !== this.config.symbol) return;
 
-    // Debug log
-    this.log(`[WS DEBUG] Order update received: orderId=${orderData.orderId}, clientOrderId=${orderData.clientOrderId}, status=${orderData.status}, tradeType=${orderData.tradeType}`, 'info');
-    this.log(`[WS DEBUG] Active buy orders: ${this.activeBuyOrders.map(o => o.orderId).join(', ')}`, 'info');
-    this.log(`[WS DEBUG] Active TP orders: ${this.activeSellTPOrders.map(o => o.orderId).join(', ')}`, 'info');
-
+    // Only handle SELL orders (TP orders) via WebSocket
+    // BUY orders are handled via polling in manageBuyOrders()
+    
     // SELL order update (TP orders)
     if (orderData.tradeType === 2) {
       const idx = this.findOrderIndex(this.activeSellTPOrders, orderData);
       
-      this.log(`[WS DEBUG] SELL order - Found index: ${idx}`, 'info');
+      this.log(`[WS] SELL order update: orderId=${orderData.orderId}, status=${orderData.status}, Found index: ${idx}`, 'info');
       
       if (idx !== -1) {
         if (orderData.status === 2) {  // FILLED
@@ -244,54 +244,10 @@ class ScalpingBot {
           this.activeSellTPOrders.splice(idx, 1);
           this.log(`[WS] TP order canceled: ${orderData.orderId}`, 'info');
         }
-      } else {
-        this.log(`[WS DEBUG] SELL order NOT FOUND in activeSellTPOrders`, 'warning');
       }
     }
-
-    // BUY order update
-    if (orderData.tradeType === 1) {
-      const idx = this.findOrderIndex(this.activeBuyOrders, orderData);
-      
-      this.log(`[WS DEBUG] BUY order - Found index: ${idx}`, 'info');
-      
-      if (idx !== -1) {
-        if (orderData.status === 2) {  // FILLED
-          const order = this.activeBuyOrders[idx];
-          
-          this.stats.totalBuyOrdersFilled++;
-          this.lastBuyFillTime = Date.now();
-          this.activeBuyOrders.splice(idx, 1);
-          
-          this.log(`✅ [WS] BUY FILLED at ${order.price}`, 'success');
-          
-          // Create TP order - use .then() since WebSocket callback is not async
-          this.createSellTPOrder(order.price, order.qty)
-            .then(() => this.log(`[WS] TP order created successfully`, 'success'))
-            .catch(err => this.log(`[WS] Failed to create TP order: ${err.message}`, 'error'));
-        }
-        else if (orderData.status === 3) {  // PARTIALLY FILLED
-          this.activeBuyOrders[idx].filledQty = orderData.cumulativeQty;
-          this.log(`[WS] BUY partially filled: ${orderData.cumulativeQty}`, 'info');
-        }
-        else if (orderData.status === 4) {  // CANCELED
-          const order = this.activeBuyOrders[idx];
-          
-          // If partially filled before cancel, create TP for filled portion
-          if (order.filledQty > 0) {
-            this.stats.totalBuyOrdersFilled++;
-            this.createSellTPOrder(order.price, order.filledQty)
-              .then(() => this.log(`[WS] TP order created for partial fill`, 'success'))
-              .catch(err => this.log(`[WS] Failed to create TP: ${err.message}`, 'error'));
-          }
-          
-          this.activeBuyOrders.splice(idx, 1);
-          this.log(`[WS] BUY order canceled: ${orderData.orderId}`, 'info');
-        }
-      } else {
-        this.log(`[WS DEBUG] BUY order NOT FOUND in activeBuyOrders`, 'warning');
-      }
-    }
+    
+    // Ignore BUY order updates from WebSocket - handled by polling
   }
 
   handleWebSocketDealUpdate(dealData) {
@@ -491,7 +447,7 @@ class ScalpingBot {
     return { success: true, message: 'Bot resumed' };
   }
 
-  // ============== Main Loop (Simplified - No polling!) ==============
+  // ============== Main Loop ==============
 
   async runMainLoop() {
     if (!this.isRunning) return;
@@ -503,21 +459,23 @@ class ScalpingBot {
         this.loopCount++;
         
         // Log orderbook less frequently (every 10 loops)
-        if (this.loopCount % 10 === 0) {
+        if (this.loopCount % 5 === 0) {
           this.log(`Orderbook: Bid=${orderbook.bestBid}, Ask=${orderbook.bestAsk}`, 'info');
         }
 
         if (!this.isPaused && !this.isWaitingForMarketSell) {
-          // Check TTL and reprice buy orders (no status polling!)
-          await this.manageBuyOrders(orderbook.bestBid);
-          
-          // Create new buy orders if needed
+          await this.updateBuyOrders(orderbook.bestBid);
           await this.createBuyOrders(orderbook.bestBid);
         }
         
-        // Fallback: If WebSocket is not connected, poll status occasionally
+        // Fallback: If WebSocket is not connected, poll TP orders occasionally
         if (!this.wsConnected && this.loopCount % 5 === 0) {
-          await this.pollOrderStatus();
+          await this.pollTPOrderStatus();
+        }
+        
+        // Reset loopCount
+        if (this.loopCount % 10 === 0) {
+          this.loopCount = 0;
         }
       }
       
@@ -527,6 +485,29 @@ class ScalpingBot {
 
     if (this.isRunning) {
       this.loopInterval = setTimeout(() => this.runMainLoop(), this.config.loopInterval);
+    }
+  }
+
+  // Check buy order status via API (old logic)
+  async checkBuyOrdersStatus() {
+    for (let i = this.activeBuyOrders.length - 1; i >= 0; i--) {
+      const order = this.activeBuyOrders[i];
+      const status = await this.checkOrderStatusAPI(order.orderId);
+      
+      if (status.filled) {
+        this.stats.totalBuyOrdersFilled++;
+        this.lastBuyFillTime = Date.now();
+        this.activeBuyOrders.splice(i, 1);
+        
+        this.log(`✅ BUY FILLED at ${order.price}`, 'success');
+        
+        // Create TP order using queue
+        this.addToTPQueue(order.price, order.qty);
+      } 
+      else if (status.partiallyFilled && status.filledQty > order.filledQty) {
+        this.activeBuyOrders[i].filledQty = status.filledQty;
+        this.log(`BUY partially filled: ${status.filledQty}/${order.qty}`, 'info');
+      }
     }
   }
 
@@ -563,32 +544,69 @@ class ScalpingBot {
     }
   }
 
-  // Fallback polling when WebSocket is down
-  async pollOrderStatus() {
-    // Check a few buy orders
-    for (const order of this.activeBuyOrders.slice(0, 3)) {
+  // Fallback polling for TP orders when WebSocket is down
+  async pollTPOrderStatus() {
+    for (let i = this.activeSellTPOrders.length - 1; i >= 0; i--) {
+      const order = this.activeSellTPOrders[i];
       const status = await this.checkOrderStatusAPI(order.orderId);
-      if (status.filled) {
-        this.stats.totalBuyOrdersFilled++;
-        this.lastBuyFillTime = Date.now();
-        const idx = this.activeBuyOrders.findIndex(o => o.orderId === order.orderId);
-        if (idx !== -1) this.activeBuyOrders.splice(idx, 1);
-        await this.createSellTPOrder(order.price, order.qty);
-        this.log(`✅ [Poll] BUY filled at ${order.price}`, 'success');
-      }
-    }
-
-    // Check a few TP orders
-    for (const order of this.activeSellTPOrders.slice(0, 3)) {
-      const status = await this.checkOrderStatusAPI(order.orderId);
+      
       if (status.filled) {
         const profit = (order.price - order.buyPrice) * order.qty;
         this.stats.totalSellOrdersFilled++;
         this.stats.realProfit += profit;
-        const idx = this.activeSellTPOrders.findIndex(o => o.orderId === order.orderId);
-        if (idx !== -1) this.activeSellTPOrders.splice(idx, 1);
+        
+        // Remove from pending positions
+        const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === order.orderId);
+        if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
+        
+        this.activeSellTPOrders.splice(i, 1);
         this.log(`💰 [Poll] TP filled! Profit: ${profit.toFixed(6)} USDT`, 'success');
       }
+    }
+  }
+
+  async updateBuyOrders(bestBid) {
+    const now = Date.now();
+    const ordersToRemove = [];
+    
+    for (let i = 0; i < this.activeBuyOrders.length; i++) {
+      const order = this.activeBuyOrders[i];
+      const age = (now - order.timestamp) / 1000;
+      const status = await this.checkOrderStatusAPI(order.orderId);
+
+      if (status.filled) {
+        this.log(`✅ Buy ${order.orderId} filled at ${order.price}`, 'success');
+        this.stats.totalBuyOrdersFilled++;
+        this.lastBuyFillTime = Date.now();
+        await this.createSellTPOrder(order.price, order.qty);
+        ordersToRemove.push(i);
+        continue;
+      }
+
+      // Check TTL expiry
+      if (age >= this.config.buyTTL) {
+        this.log(`Order ${order.orderId} expired`, 'warning');
+        await this.cancelOrder(order.orderId);
+        this.stats.totalBuyOrdersCanceled++;
+        if (order.filledQty > 0) {
+          this.stats.totalBuyOrdersFilled++;
+          await this.createSellTPOrder(order.price, order.filledQty);
+        }
+        ordersToRemove.push(i);
+        continue;
+      }
+
+      const tickDiff = Math.abs(order.price - bestBid) / this.config.tickSize;
+      if (tickDiff >= this.config.repriceTicks) {
+        this.log(`Repricing ${order.orderId} (${tickDiff.toFixed(1)} ticks)`, 'info');
+        await this.cancelOrder(order.orderId);
+        this.stats.totalBuyOrdersCanceled++;
+        ordersToRemove.push(i);
+      }
+    }
+
+    for (let i = ordersToRemove.length - 1; i >= 0; i--) {
+      this.activeBuyOrders.splice(ordersToRemove[i], 1);
     }
   }
 
@@ -600,9 +618,7 @@ class ScalpingBot {
     const totalPotentialOrders = this.activeBuyOrders.length + this.activeSellTPOrders.length;
     
     if (totalPotentialOrders >= this.config.maxSellTPOrders) {
-      if (this.loopCount % 20 === 0) {
-        this.log(`🛑 MAX TP REACHED (Buy: ${this.activeBuyOrders.length} + TP: ${this.activeSellTPOrders.length} = ${totalPotentialOrders}/${this.config.maxSellTPOrders})`, 'warning');
-      }
+      this.log(`🛑 MAX TP REACHED (Buy: ${this.activeBuyOrders.length} + TP: ${this.activeSellTPOrders.length} = ${totalPotentialOrders}/${this.config.maxSellTPOrders})`, 'warning');
       return;
     }
 
@@ -637,7 +653,7 @@ class ScalpingBot {
           orderId, price: buyPrice, qty: this.config.orderQty,
           filledQty: 0, timestamp: Date.now(), layer
         });
-        //this.log(`[DEBUG] Stored BUY order with orderId: ${orderId}`, 'info');
+        this.log(`[DEBUG] Stored BUY order with orderId: ${orderId}`, 'info');
       }
 
       if (this.activeBuyOrders.length >= this.config.maxBuyOrders) break;
@@ -680,7 +696,7 @@ class ScalpingBot {
       this.stats.totalSellOrdersCreated++;
       this.activeSellTPOrders.push({ orderId, price: tpPrice, qty, buyPrice, timestamp: Date.now() });
       this.stats.pendingPositions.push({ orderId, buyPrice, qty, sellPrice: tpPrice });
-      //this.log(`[DEBUG] Stored SELL TP order with orderId: ${orderId}`, 'info');
+      this.log(`[DEBUG] Stored SELL TP order with orderId: ${orderId}`, 'info');
     }
   }
 
@@ -741,7 +757,7 @@ class ScalpingBot {
         price: price.toString()
       });
       if (result.success) {
-        //this.log(`[DEBUG] REST API returned orderId: ${result.data.orderId}`, 'info');
+        this.log(`[DEBUG] REST API returned orderId: ${result.data.orderId}`, 'info');
         return result.data.orderId;
       }
       this.log(`Order failed: ${result.message}`, 'error');
