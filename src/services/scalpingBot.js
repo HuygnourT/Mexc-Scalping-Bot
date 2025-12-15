@@ -7,7 +7,7 @@ class ScalpingBot {
     this.isPaused = false;
     this.config = {};
     this.activeBuyOrders = [];
-    this.activeSellTPOrders = [];
+    this.activeSellTPOrders = [];  // Will be kept sorted by price (low to high)
     this.loopInterval = null;
     this.lastBuyFillTime = 0;
     this.isWaitingForMarketSell = false;
@@ -159,6 +159,12 @@ class ScalpingBot {
     return this.stats.pendingPositions.reduce((sum, p) => sum + p.qty, 0);
   }
 
+  // ============== Helper: Sort TP Orders by Price (Low to High) ==============
+  
+  sortTPOrdersByPrice() {
+    this.activeSellTPOrders.sort((a, b) => a.price - b.price);
+  }
+
   // ============== WebSocket Setup ==============
   
   setupWebSocket() {
@@ -246,6 +252,8 @@ class ScalpingBot {
           if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
           
           this.activeSellTPOrders.splice(idx, 1);
+          // No need to re-sort after removal
+          
           this.log(`💰 [WS] TP FILLED! Price: ${order.price}, Profit: ${profit.toFixed(6)} USDT`, 'success');
         }
         else if (orderData.status === 4) {  // CANCELED
@@ -325,6 +333,10 @@ class ScalpingBot {
 
         this.log(`✅ Loaded SELL order: ${order.orderId} @ ${sellPrice} qty: ${qty}`, 'success');
       }
+
+      // Sort by price (low to high) after loading
+      this.sortTPOrdersByPrice();
+      this.log(`📊 TP orders sorted by price (${this.activeSellTPOrders.length} orders, lowest: ${this.activeSellTPOrders[0]?.price || 'N/A'})`, 'info');
 
       return { success: true, count: sellOrders.length };
 
@@ -557,13 +569,20 @@ class ScalpingBot {
     }
   }
 
-  // Fallback polling for TP orders - runs periodically as backup
+  // Optimized polling for TP orders - check from lowest price first, break if not filled
+  // Logic: Lower price TP orders are closer to market, more likely to fill first
+  // If lowest price order is not filled, higher price orders are unlikely to be filled
   async pollTPOrderStatus() {
     if (this.activeSellTPOrders.length === 0) return;
     
-    this.log(`[Poll] Checking ${this.activeSellTPOrders.length} TP orders...`, 'info');
+    this.log(`[Poll] Checking ${this.activeSellTPOrders.length} TP orders (sorted low→high)...`, 'info');
     
-    for (let i = this.activeSellTPOrders.length - 1; i >= 0; i--) {
+    // Array is already sorted by price (low to high)
+    // Check from lowest price first
+    let filledCount = 0;
+    const ordersToRemove = [];
+    
+    for (let i = 0; i < this.activeSellTPOrders.length; i++) {
       const order = this.activeSellTPOrders[i];
       const status = await this.checkOrderStatusAPI(order.orderId);
       
@@ -576,9 +595,24 @@ class ScalpingBot {
         const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === order.orderId);
         if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
         
-        this.activeSellTPOrders.splice(i, 1);
+        ordersToRemove.push(i);
+        filledCount++;
         this.log(`💰 [Poll] TP FILLED! Price: ${order.price}, Profit: ${profit.toFixed(6)} USDT`, 'success');
+      } else {
+        // Optimization: If this order (lowest remaining unfilled) is not filled,
+        // higher price orders are very unlikely to be filled - break early
+        this.log(`[Poll] Order at ${order.price} not filled, skipping higher prices (checked ${i + 1}/${this.activeSellTPOrders.length})`, 'info');
+        break;
       }
+    }
+    
+    // Remove filled orders (in reverse to maintain indices)
+    for (let i = ordersToRemove.length - 1; i >= 0; i--) {
+      this.activeSellTPOrders.splice(ordersToRemove[i], 1);
+    }
+    
+    if (filledCount > 0) {
+      this.log(`[Poll] ${filledCount} TP order(s) filled, ${this.activeSellTPOrders.length} remaining`, 'success');
     }
   }
 
@@ -589,7 +623,7 @@ class ScalpingBot {
     // Check TOTAL: active buy orders + active TP orders
     const totalPotentialOrders = this.activeBuyOrders.length + this.activeSellTPOrders.length;
     
-    if (totalPotentialOrders >= this.config.maxSellTPOrders) {
+    if (totalPotentialOrders >= this.config.maxSellTPOrders + 1) {
       this.log(`🛑 MAX TP REACHED (Buy: ${this.activeBuyOrders.length} + TP: ${this.activeSellTPOrders.length} = ${totalPotentialOrders}/${this.config.maxSellTPOrders})`, 'warning');
       return;
     }
@@ -671,7 +705,7 @@ class ScalpingBot {
 
   async createSellTPOrder(buyPrice, qty) {
     if (this.activeSellTPOrders.length >= this.config.maxSellTPOrders) {
-      this.log(`⚠️ Max TP orders reached, market selling oldest...`, 'warning');
+      this.log(`⚠️ Max TP orders reached, market selling lowest price order...`, 'warning');
       
       let highestIdx = 0;
       for (let i = 1; i < this.activeSellTPOrders.length; i++) {
@@ -684,14 +718,14 @@ class ScalpingBot {
       await this.cancelOrder(highest.orderId);
       this.stats.totalSellOrdersCanceled++;
       
-      const marketOrderId = await this.placeMarketOrder('Sell', highest.qty);
+      const marketOrderId = await this.placeMarketOrder('Sell', lowest.qty);
       if (marketOrderId) {
         const orderbook = await this.fetchOrderbook();
-        const sellPrice = orderbook ? orderbook.bestBid : highest.buyPrice;
-        const profitLoss = (sellPrice - highest.buyPrice) * highest.qty;
+        const sellPrice = orderbook ? orderbook.bestBid : lowest.buyPrice;
+        const profitLoss = (sellPrice - lowest.buyPrice) * lowest.qty;
         this.stats.realProfit += profitLoss;
         this.stats.totalSellOrdersFilled++;
-        this.log(`💰 Market sold @ ~${sellPrice}, P/L: ${profitLoss.toFixed(6)}`, profitLoss >= 0 ? 'success' : 'error');
+        this.log(`💰 Market sold lowest @ ~${sellPrice} (was TP at ${lowest.price}), P/L: ${profitLoss.toFixed(6)}`, profitLoss >= 0 ? 'success' : 'error');
       }
       
       this.activeSellTPOrders.splice(highestIdx, 1);
@@ -703,7 +737,11 @@ class ScalpingBot {
     const orderId = await this.placeLimitOrder('Sell', tpPrice, qty);
     if (orderId) {
       this.stats.totalSellOrdersCreated++;
+      
+      // Add to array and re-sort to maintain price order
       this.activeSellTPOrders.push({ orderId, price: tpPrice, qty, buyPrice, timestamp: Date.now() });
+      this.sortTPOrdersByPrice();
+      
       this.stats.pendingPositions.push({ orderId, buyPrice, qty, sellPrice: tpPrice });
     }
   }
