@@ -704,31 +704,35 @@ class ScalpingBot {
   }
 
   async createSellTPOrder(buyPrice, qty) {
+    // When max TP reached, sell HIGHEST price order at market
+    // Highest price = furthest from current market = least likely to fill soon
+    // Keep lower price orders = closer to market, more likely to fill
     if (this.activeSellTPOrders.length >= this.config.maxSellTPOrders) {
-      this.log(`⚠️ Max TP orders reached, market selling lowest price order...`, 'warning');
+      this.log(`⚠️ Max TP orders reached, market selling highest price order...`, 'warning');
       
-      let highestIdx = 0;
-      for (let i = 1; i < this.activeSellTPOrders.length; i++) {
-        if (this.activeSellTPOrders[i].price > this.activeSellTPOrders[highestIdx].price) {
-          highestIdx = i;
-        }
-      }
-      
+      // Array is sorted low to high, so last index is the highest price
+      const highestIdx = this.activeSellTPOrders.length - 1;
       const highest = this.activeSellTPOrders[highestIdx];
+      
       await this.cancelOrder(highest.orderId);
       this.stats.totalSellOrdersCanceled++;
       
-      const marketOrderId = await this.placeMarketOrder('Sell', lowest.qty);
+      const marketOrderId = await this.placeMarketOrder('Sell', highest.qty);
       if (marketOrderId) {
         const orderbook = await this.fetchOrderbook();
-        const sellPrice = orderbook ? orderbook.bestBid : lowest.buyPrice;
-        const profitLoss = (sellPrice - lowest.buyPrice) * lowest.qty;
+        const sellPrice = orderbook ? orderbook.bestBid : highest.buyPrice;
+        const profitLoss = (sellPrice - highest.buyPrice) * highest.qty;
         this.stats.realProfit += profitLoss;
         this.stats.totalSellOrdersFilled++;
-        this.log(`💰 Market sold lowest @ ~${sellPrice} (was TP at ${lowest.price}), P/L: ${profitLoss.toFixed(6)}`, profitLoss >= 0 ? 'success' : 'error');
+        this.log(`💰 Market sold highest @ ~${sellPrice} (was TP at ${highest.price}), P/L: ${profitLoss.toFixed(6)}`, profitLoss >= 0 ? 'success' : 'error');
       }
       
-      this.activeSellTPOrders.splice(highestIdx, 1);
+      // Remove from pending positions
+      const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === highest.orderId);
+      if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
+      
+      // Remove highest (last element)
+      this.activeSellTPOrders.pop();
     }
 
     const tpPrice = this.roundToTick(buyPrice + (this.config.tpTicks * this.config.tickSize));
