@@ -208,6 +208,9 @@ class MexcWebSocket {
   handleMessage(data) {
     try {
       const message = JSON.parse(data.toString());
+      
+      // Debug: Log ALL messages to see what we're receiving
+      console.log(`[WS] Raw message received:`, JSON.stringify(message).substring(0, 500));
 
       // Order update
       if (message.channel === 'spot@private.orders.v3.api.pb' && message.privateOrders) {
@@ -233,10 +236,13 @@ class MexcWebSocket {
           timestamp: message.sendTime
         };
 
-        console.log(`[WS] Order update: ${orderData.symbol} orderId=${orderData.orderId} status=${orderData.status} tradeType=${orderData.tradeType}`);
+        console.log(`[WS] Order update parsed: ${orderData.symbol} orderId=${orderData.orderId} status=${orderData.status} tradeType=${orderData.tradeType}`);
 
         if (this.onOrderUpdate) {
+          console.log('[WS] Calling onOrderUpdate callback...');
           this.onOrderUpdate(orderData);
+        } else {
+          console.log('[WS] WARNING: onOrderUpdate callback is not set!');
         }
       }
 
