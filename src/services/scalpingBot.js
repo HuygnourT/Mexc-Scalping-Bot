@@ -19,6 +19,11 @@ class ScalpingBot {
     this.runHistory = [];
     this.loopCount = 0;
     this.wsConnected = false;
+    
+    // Queue for pending TP orders to create
+    this.pendingTPQueue = [];
+    this.isProcessingTPQueue = false;
+    
     this.stats = {
       totalBuyOrdersCreated: 0,
       totalBuyOrdersFilled: 0,
@@ -94,6 +99,7 @@ class ScalpingBot {
       isPaused: this.isPaused,
       isWaitingForMarketSell: this.isWaitingForMarketSell,
       wsConnected: this.wsConnected,
+      pendingTPQueueSize: this.pendingTPQueue.length,
       stats: this.stats,
       activeBuyOrders: this.activeBuyOrders,
       activeSellTPOrders: this.activeSellTPOrders,
@@ -464,7 +470,13 @@ class ScalpingBot {
         }
 
         if (!this.isPaused && !this.isWaitingForMarketSell) {
-          await this.updateBuyOrders(orderbook.bestBid);
+          // Check buy order status via polling (old logic)
+          await this.checkBuyOrdersStatus();
+          
+          // Check TTL and reprice buy orders
+          await this.manageBuyOrders(orderbook.bestBid);
+          
+          // Create new buy orders if needed
           await this.createBuyOrders(orderbook.bestBid);
         }
         
@@ -565,51 +577,6 @@ class ScalpingBot {
     }
   }
 
-  async updateBuyOrders(bestBid) {
-    const now = Date.now();
-    const ordersToRemove = [];
-    
-    for (let i = 0; i < this.activeBuyOrders.length; i++) {
-      const order = this.activeBuyOrders[i];
-      const age = (now - order.timestamp) / 1000;
-      const status = await this.checkOrderStatusAPI(order.orderId);
-
-      if (status.filled) {
-        this.log(`✅ Buy ${order.orderId} filled at ${order.price}`, 'success');
-        this.stats.totalBuyOrdersFilled++;
-        this.lastBuyFillTime = Date.now();
-        await this.createSellTPOrder(order.price, order.qty);
-        ordersToRemove.push(i);
-        continue;
-      }
-
-      // Check TTL expiry
-      if (age >= this.config.buyTTL) {
-        this.log(`Order ${order.orderId} expired`, 'warning');
-        await this.cancelOrder(order.orderId);
-        this.stats.totalBuyOrdersCanceled++;
-        if (order.filledQty > 0) {
-          this.stats.totalBuyOrdersFilled++;
-          await this.createSellTPOrder(order.price, order.filledQty);
-        }
-        ordersToRemove.push(i);
-        continue;
-      }
-
-      const tickDiff = Math.abs(order.price - bestBid) / this.config.tickSize;
-      if (tickDiff >= this.config.repriceTicks) {
-        this.log(`Repricing ${order.orderId} (${tickDiff.toFixed(1)} ticks)`, 'info');
-        await this.cancelOrder(order.orderId);
-        this.stats.totalBuyOrdersCanceled++;
-        ordersToRemove.push(i);
-      }
-    }
-
-    for (let i = ordersToRemove.length - 1; i >= 0; i--) {
-      this.activeBuyOrders.splice(ordersToRemove[i], 1);
-    }
-  }
-
   async createBuyOrders(bestBid) {
     const needed = this.config.maxBuyOrders - this.activeBuyOrders.length;
     if (needed <= 0) return;
@@ -658,6 +625,44 @@ class ScalpingBot {
 
       if (this.activeBuyOrders.length >= this.config.maxBuyOrders) break;
     }
+  }
+
+  // ============== TP Order Queue System ==============
+  
+  // Add TP order to queue
+  addToTPQueue(buyPrice, qty) {
+    this.pendingTPQueue.push({ buyPrice, qty, timestamp: Date.now() });
+    this.log(`📋 Added to TP queue: buyPrice=${buyPrice}, qty=${qty}, Queue size: ${this.pendingTPQueue.length}`, 'info');
+    
+    // Start processing if not already running
+    this.processTPQueue();
+  }
+
+  // Process TP queue one by one
+  async processTPQueue() {
+    // Prevent multiple simultaneous processing
+    if (this.isProcessingTPQueue) return;
+    if (this.pendingTPQueue.length === 0) return;
+    
+    this.isProcessingTPQueue = true;
+    
+    while (this.pendingTPQueue.length > 0 && this.isRunning) {
+      const item = this.pendingTPQueue.shift();
+      this.log(`📋 Processing TP queue: buyPrice=${item.buyPrice}, qty=${item.qty}, Remaining: ${this.pendingTPQueue.length}`, 'info');
+      
+      try {
+        await this.createSellTPOrder(item.buyPrice, item.qty);
+        // Small delay between orders to avoid rate limits
+        await this.sleep(100);
+      } catch (error) {
+        this.log(`❌ Failed to create TP order: ${error.message}`, 'error');
+        // Re-add to queue if failed (retry)
+        this.pendingTPQueue.unshift(item);
+        await this.sleep(500);
+      }
+    }
+    
+    this.isProcessingTPQueue = false;
   }
 
   async createSellTPOrder(buyPrice, qty) {
