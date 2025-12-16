@@ -400,6 +400,9 @@ function renderStatus(status) {
         if (status.isPaused) {
             statusText = 'Bot Paused';
             statusClass = 'paused';
+        } else if (status.isRepricingMode) {
+            statusText = '🔄 Repricing Mode (Buy Paused)';
+            statusClass = 'repricing';
         } else if (status.isWaitingForMarketSell) {
             statusText = '⏳ Waiting Market Sell';
             statusClass = 'running';
@@ -410,11 +413,40 @@ function renderStatus(status) {
         const buyOrders = status.activeBuyOrders || [];
         const tpOrders = status.activeSellTPOrders || [];
         
+        // Repricing order info
+        let repricingInfo = '';
+        if (status.isRepricingMode && status.repricingOrder) {
+            const ro = status.repricingOrder;
+            repricingInfo = `
+                <div class="repricing-info" style="background: #2e1a3e; border: 2px solid #f59e0b; border-radius: 8px; padding: 12px; margin: 10px 20px;">
+                    <div style="color: #f59e0b; font-weight: 600; margin-bottom: 8px;">🔄 Repricing Active</div>
+                    <div style="display: flex; gap: 20px; font-size: 12px; color: #fbbf24;">
+                        <span>Price: ${ro.price.toFixed(6)}</span>
+                        <span>Qty: ${ro.qty}</span>
+                        <span>Original: ${ro.originalPrice?.toFixed(6) || '-'}</span>
+                    </div>
+                    <div style="font-size: 11px; color: #888; margin-top: 6px;">Will reprice every 10s until filled. Buy orders paused.</div>
+                </div>
+            `;
+        }
+        
+        // Pending TP queue info
+        let queueInfo = '';
+        if (status.pendingTPQueueSize > 0) {
+            queueInfo = `
+                <div style="background: #1a2e3e; border-radius: 6px; padding: 8px 12px; margin: 0 20px 10px; font-size: 12px; color: #60a5fa;">
+                    📋 Pending TP Queue: ${status.pendingTPQueueSize} order(s) waiting
+                </div>
+            `;
+        }
+        
         statusEl.innerHTML = `
-            <div class="status-header-main ${statusClass}">
-                <span class="status-dot"></span>
+            <div class="status-header-main ${statusClass}" style="${status.isRepricingMode ? 'background: linear-gradient(135deg, #f59e0b, #d97706);' : ''}">
+                <span class="status-dot ${status.isRepricingMode ? '' : ''}"></span>
                 <span>${statusText}</span>
             </div>
+            ${repricingInfo}
+            ${queueInfo}
             <div class="stats-grid">
                 <div class="stat-card buy-stats">
                     <div class="stat-icon">📥</div>
@@ -462,10 +494,10 @@ function renderStatus(status) {
                 </div>
             </div>
             <div class="orders-section">
-                <div class="orders-panel" style="${status.isPaused ? 'opacity: 0.5;' : ''}">
+                <div class="orders-panel" style="${status.isPaused || status.isRepricingMode ? 'opacity: 0.5;' : ''}">
                     <div class="panel-header">
-                        <span>${status.isPaused ? '🛑' : '🟢'}</span>
-                        <span>Buy Orders (${buyOrders.length}/${config.maxBuyOrders || 3})</span>
+                        <span>${status.isPaused || status.isRepricingMode ? '🛑' : '🟢'}</span>
+                        <span>Buy Orders (${buyOrders.length}/${config.maxBuyOrders || 3}) ${status.isRepricingMode ? '- PAUSED' : ''}</span>
                     </div>
                     <div class="orders-list">
                         ${buyOrders.length > 0 ? buyOrders.map(o => `
@@ -485,9 +517,9 @@ function renderStatus(status) {
                     </div>
                     <div class="orders-list">
                         ${tpOrders.length > 0 ? tpOrders.map(o => `
-                            <div class="order-item tp-order">
+                            <div class="order-item tp-order ${o.isAveraged ? 'averaged' : ''}" style="${o.isAveraged ? 'border-left-color: #f59e0b;' : ''}">
                                 <span class="order-price">${o.price.toFixed(6)}</span>
-                                <span class="order-qty">${o.qty}</span>
+                                <span class="order-qty">${o.qty}${o.isAveraged ? ' (avg)' : ''}</span>
                                 <span class="order-profit">+${((o.price - o.buyPrice) * o.qty).toFixed(6)}</span>
                             </div>
                         `).join('') : '<div class="no-orders">No active TP orders</div>'}

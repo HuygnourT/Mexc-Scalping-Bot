@@ -24,6 +24,13 @@ class ScalpingBot {
     this.pendingTPQueue = [];
     this.isProcessingTPQueue = false;
     
+    // Repricing mode state (when max TP reached)
+    this.isRepricingMode = false;
+    this.repricingOrder = null;  // The order being repriced
+    this.repricingStartTime = null;
+    this.lastRepriceTime = null;
+    this.pendingBuyAfterReprice = null;  // Store pending buy info to create TP after reprice fills
+    
     this.stats = {
       totalBuyOrdersCreated: 0,
       totalBuyOrdersFilled: 0,
@@ -91,6 +98,13 @@ class ScalpingBot {
     this.activeSellTPOrders = [];
     this.pendingTPQueue = [];
     this.isProcessingTPQueue = false;
+    
+    // Reset repricing mode
+    this.isRepricingMode = false;
+    this.repricingOrder = null;
+    this.repricingStartTime = null;
+    this.lastRepriceTime = null;
+    this.pendingBuyAfterReprice = null;
   }
 
   getStatus() {
@@ -98,6 +112,8 @@ class ScalpingBot {
       isRunning: this.isRunning,
       isPaused: this.isPaused,
       isWaitingForMarketSell: this.isWaitingForMarketSell,
+      isRepricingMode: this.isRepricingMode,
+      repricingOrder: this.repricingOrder,
       wsConnected: this.wsConnected,
       pendingTPQueueSize: this.pendingTPQueue.length,
       stats: this.stats,
@@ -234,6 +250,16 @@ class ScalpingBot {
     // SELL order update (TP orders)
     if (orderData.tradeType === 2) {
       this.log(`[WS] SELL update: orderId=${orderData.orderId}, clientOrderId=${orderData.clientOrderId}, status=${orderData.status}`, 'info');
+      
+      // Check if this is the repricing order that got filled
+      if (this.isRepricingMode && this.repricingOrder && 
+          (this.repricingOrder.orderId === orderData.orderId || 
+           this.repricingOrder.orderId === orderData.clientOrderId)) {
+        if (orderData.status === 2) {  // FILLED
+          this.handleRepricingOrderFilled(this.repricingOrder);
+          return;
+        }
+      }
       
       const idx = this.findOrderIndex(this.activeSellTPOrders, orderData);
       
@@ -399,6 +425,14 @@ class ScalpingBot {
     
     this.log('⏹️ Stopping bot...', 'warning');
 
+    // Cancel repricing order if any
+    if (this.isRepricingMode && this.repricingOrder) {
+      await this.cancelOrder(this.repricingOrder.orderId);
+      this.stats.totalSellOrdersCanceled++;
+      this.isRepricingMode = false;
+      this.repricingOrder = null;
+    }
+
     // Cancel all buy orders
     for (const order of this.activeBuyOrders) {
       await this.cancelOrder(order.orderId);
@@ -492,7 +526,12 @@ class ScalpingBot {
           this.loopCount = 0;
         }
 
-        if (!this.isPaused && !this.isWaitingForMarketSell) {
+        // Handle repricing mode
+        if (this.isRepricingMode) {
+          await this.handleRepricingMode(orderbook);
+        }
+
+        if (!this.isPaused && !this.isWaitingForMarketSell && !this.isRepricingMode) {
           // Check buy order status via polling (old logic)
           await this.checkBuyOrdersStatus();
           
@@ -511,6 +550,91 @@ class ScalpingBot {
     if (this.isRunning) {
       this.loopInterval = setTimeout(() => this.runMainLoop(), this.config.loopInterval);
     }
+  }
+
+  // ============== Repricing Mode Handler ==============
+
+  async handleRepricingMode(orderbook) {
+  if (!this.repricingOrder) {
+    this.isRepricingMode = false;
+    return;
+  }
+
+  const now = Date.now();
+  const timeSinceLastReprice = now - (this.lastRepriceTime || this.repricingStartTime);
+  
+  // Check if repricing order is filled
+  const status = await this.checkOrderStatusAPI(this.repricingOrder.orderId);
+  if (status.filled) {
+    this.handleRepricingOrderFilled(this.repricingOrder);
+    return;
+  }
+
+  // Reprice every 10 seconds
+  if (timeSinceLastReprice >= 10000) {
+    // Calculate new price: bestAsk + tpTicks
+    const newPrice = this.roundToTick(orderbook.bestAsk + (this.config.tpTicks * this.config.tickSize));
+    
+    // Only reprice if new price is LOWER than current price
+    if (newPrice >= this.repricingOrder.price) {
+      this.log(`🔄 Repricing skipped: newPrice (${newPrice}) >= currentPrice (${this.repricingOrder.price})`, 'info');
+      this.lastRepriceTime = now;  // Reset timer to check again in 10s
+      return;
+    }
+    
+    this.log(`🔄 Repricing mode: 10s elapsed, repricing to bestAsk + tpTicks...`, 'warning');
+    
+    // Cancel current order
+    await this.cancelOrder(this.repricingOrder.orderId);
+    this.stats.totalSellOrdersCanceled++;
+    
+    this.log(`🔄 Repricing from ${this.repricingOrder.price} to ${newPrice} (bestAsk: ${orderbook.bestAsk})`, 'warning');
+    
+    // Place new order at the new price
+    const newOrderId = await this.placeLimitOrder('Sell', newPrice, this.repricingOrder.qty);
+    if (newOrderId) {
+      this.repricingOrder.orderId = newOrderId;
+      this.repricingOrder.price = newPrice;
+      this.lastRepriceTime = now;
+      this.stats.totalSellOrdersCreated++;
+      this.log(`✅ Repriced SELL order placed at ${newPrice}`, 'success');
+    } else {
+      this.log(`❌ Failed to place repriced order, will retry...`, 'error');
+    }
+  } else {
+    const remaining = Math.ceil((10000 - timeSinceLastReprice) / 1000);
+    this.log(`⏳ Repricing mode: Waiting ${remaining}s before next reprice...`, 'info');
+  }
+}
+
+
+  handleRepricingOrderFilled(order) {
+    const profit = (order.price - order.buyPrice) * order.qty;
+    
+    this.stats.totalSellOrdersFilled++;
+    this.stats.realProfit += profit;
+    
+    // Remove from pending positions
+    const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === order.orderId);
+    if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
+    
+    this.log(`💰 Repricing order FILLED! Price: ${order.price}, Profit: ${profit.toFixed(6)} USDT`, 'success');
+    
+    // Exit repricing mode
+    this.isRepricingMode = false;
+    this.repricingOrder = null;
+    this.repricingStartTime = null;
+    this.lastRepriceTime = null;
+    
+    // Now create TP for the pending buy that triggered repricing
+    if (this.pendingBuyAfterReprice) {
+      const { buyPrice, qty } = this.pendingBuyAfterReprice;
+      this.pendingBuyAfterReprice = null;
+      this.log(`▶️ Repricing complete, creating TP for pending buy at ${buyPrice}...`, 'success');
+      this.addToTPQueue(buyPrice, qty);
+    }
+    
+    this.log(`▶️ Repricing complete, resuming buy orders...`, 'success');
   }
 
   // Check buy order status via API (old logic)
@@ -685,6 +809,13 @@ class ScalpingBot {
     this.isProcessingTPQueue = true;
     
     while (this.pendingTPQueue.length > 0 && this.isRunning) {
+      // If in repricing mode, wait for it to complete
+      if (this.isRepricingMode) {
+        this.log(`📋 TP queue paused - waiting for repricing to complete...`, 'info');
+        await this.sleep(1000);
+        continue;
+      }
+      
       const item = this.pendingTPQueue.shift();
       this.log(`📋 Processing TP queue: buyPrice=${item.buyPrice}, qty=${item.qty}, Remaining: ${this.pendingTPQueue.length}`, 'info');
       
@@ -704,49 +835,200 @@ class ScalpingBot {
   }
 
   async createSellTPOrder(buyPrice, qty) {
-    // When max TP reached, sell HIGHEST price order at market
-    // Highest price = furthest from current market = least likely to fill soon
-    // Keep lower price orders = closer to market, more likely to fill
+    // FEATURE 2: When max TP reached, reprice highest instead of market sell
     if (this.activeSellTPOrders.length >= this.config.maxSellTPOrders) {
-      this.log(`⚠️ Max TP orders reached, market selling highest price order...`, 'warning');
+      this.log(`⚠️ Max TP orders reached, entering repricing mode...`, 'warning');
       
       // Array is sorted low to high, so last index is the highest price
       const highestIdx = this.activeSellTPOrders.length - 1;
       const highest = this.activeSellTPOrders[highestIdx];
       
+      // Cancel the highest price order
       await this.cancelOrder(highest.orderId);
       this.stats.totalSellOrdersCanceled++;
       
-      const marketOrderId = await this.placeMarketOrder('Sell', highest.qty);
-      if (marketOrderId) {
-        const orderbook = await this.fetchOrderbook();
-        const sellPrice = orderbook ? orderbook.bestBid : highest.buyPrice;
-        const profitLoss = (sellPrice - highest.buyPrice) * highest.qty;
-        this.stats.realProfit += profitLoss;
-        this.stats.totalSellOrdersFilled++;
-        this.log(`💰 Market sold highest @ ~${sellPrice} (was TP at ${highest.price}), P/L: ${profitLoss.toFixed(6)}`, profitLoss >= 0 ? 'success' : 'error');
+      // Remove from active orders
+      this.activeSellTPOrders.pop();
+      
+      // Get current orderbook for repricing
+      const orderbook = await this.fetchOrderbook();
+      if (!orderbook) {
+        this.log(`❌ Failed to get orderbook for repricing, falling back to market sell...`, 'error');
+        // Fallback to market sell if orderbook unavailable
+        const marketOrderId = await this.placeMarketOrder('Sell', highest.qty);
+        if (marketOrderId) {
+          const profitLoss = (orderbook?.bestBid || highest.buyPrice) - highest.buyPrice;
+          this.stats.realProfit += profitLoss * highest.qty;
+          this.stats.totalSellOrdersFilled++;
+        }
+        // Still create the new TP order
+        await this.createNewTPOrderWithAveraging(buyPrice, qty);
+        return;
       }
       
-      // Remove from pending positions
-      const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === highest.orderId);
-      if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
+      // Calculate new reprice: bestAsk + tpTicks
+      const repricePrice = this.roundToTick(orderbook.bestAsk + (this.config.tpTicks * this.config.tickSize));
       
-      // Remove highest (last element)
-      this.activeSellTPOrders.pop();
+      this.log(`🔄 Repricing highest TP from ${highest.price} to ${repricePrice} (bestAsk: ${orderbook.bestAsk} + ${this.config.tpTicks} ticks)`, 'warning');
+      
+      // Place the repriced order
+      const newOrderId = await this.placeLimitOrder('Sell', repricePrice, highest.qty);
+      if (newOrderId) {
+        this.stats.totalSellOrdersCreated++;
+        
+        // Enter repricing mode - pause buy orders until this fills
+        this.isRepricingMode = true;
+        this.repricingOrder = {
+          orderId: newOrderId,
+          price: repricePrice,
+          qty: highest.qty,
+          buyPrice: highest.buyPrice,
+          originalPrice: highest.price,
+          timestamp: Date.now()
+        };
+        this.repricingStartTime = Date.now();
+        this.lastRepriceTime = Date.now();
+        
+        // Store the pending buy info to create TP after reprice fills
+        this.pendingBuyAfterReprice = { buyPrice, qty };
+        
+        this.log(`⏸️ Repricing mode ACTIVE - Buy orders paused until fill`, 'warning');
+        this.log(`📋 Pending TP for buyPrice=${buyPrice}, qty=${qty} will be created after reprice fills`, 'info');
+      } else {
+        this.log(`❌ Failed to place repriced order`, 'error');
+      }
+      
+      return;
     }
 
-    const tpPrice = this.roundToTick(buyPrice + (this.config.tpTicks * this.config.tickSize));
-    this.log(`Creating SELL TP at ${tpPrice} for ${qty}`, 'success');
+    // Average with highest existing TP order
+    await this.createNewTPOrderWithAveraging(buyPrice, qty);
+  }
 
-    const orderId = await this.placeLimitOrder('Sell', tpPrice, qty);
+  async createNewTPOrderWithAveraging(buyPrice, qty) {
+    const plannedTPPrice = this.roundToTick(buyPrice + (this.config.tpTicks * this.config.tickSize));
+    
+    // Average with highest existing TP order ONLY IF:
+    // 1. There are existing TP orders
+    // 2. The highest existing price is HIGHER than the new planned price
+    // 3. The price difference is at least 100 ticks
+    
+    if (this.activeSellTPOrders.length > 0) {
+      // Array is sorted low to high, last element is highest price
+      const highestExisting = this.activeSellTPOrders[this.activeSellTPOrders.length - 1];
+      
+      // Calculate tick difference
+      const priceDiff = highestExisting.price - plannedTPPrice;
+      const tickDiff = Math.round(priceDiff / this.config.tickSize);
+      
+      this.log(`📊 Checking average conditions: Highest=${highestExisting.price}, New=${plannedTPPrice}, Diff=${tickDiff} ticks`, 'info');
+      
+      // Only average if:
+      // 1. Highest existing price > new planned price (tickDiff > 0)
+      // 2. Difference is at least 100 ticks
+      if (tickDiff >= 100) {
+        this.log(`📊 AVERAGING: Diff=${tickDiff} ticks >= 100, highest (${highestExisting.price}) > new (${plannedTPPrice})`, 'info');
+        
+        // Calculate averaged price (weighted average of the two sell prices)
+        const totalQty = highestExisting.qty + qty;
+        const avgSellPrice = this.roundToTick(
+          (highestExisting.price * highestExisting.qty + plannedTPPrice * qty) / totalQty
+        );
+        
+        // Each order keeps its original quantity
+        const qty1 = highestExisting.qty;  // Original qty from highest existing
+        const qty2 = qty;                   // Original qty from new order
+        
+        this.log(`📊 Creating 2 orders at avg price ${avgSellPrice}: Order1 qty=${qty1}, Order2 qty=${qty2}`, 'info');
+        
+        // Cancel the highest existing order
+        await this.cancelOrder(highestExisting.orderId);
+        this.stats.totalSellOrdersCanceled++;
+        
+        // Remove from pending positions
+        const posIdx = this.stats.pendingPositions.findIndex(p => p.orderId === highestExisting.orderId);
+        if (posIdx !== -1) this.stats.pendingPositions.splice(posIdx, 1);
+        
+        // Remove from active orders (last element)
+        this.activeSellTPOrders.pop();
+        
+        // Create FIRST sell order at averaged price (for the old highest order's qty)
+        this.log(`Creating SELL TP #1 at ${avgSellPrice} for ${qty1}`, 'success');
+        const orderId1 = await this.placeLimitOrder('Sell', avgSellPrice, qty1);
+        if (orderId1) {
+          this.stats.totalSellOrdersCreated++;
+          this.activeSellTPOrders.push({ 
+            orderId: orderId1, 
+            price: avgSellPrice, 
+            qty: qty1, 
+            buyPrice: highestExisting.buyPrice,  // Keep original buy price for accurate profit calc
+            timestamp: Date.now(),
+            isAveraged: true
+          });
+          this.stats.pendingPositions.push({ 
+            orderId: orderId1, 
+            buyPrice: highestExisting.buyPrice, 
+            qty: qty1, 
+            sellPrice: avgSellPrice 
+          });
+        }
+        
+        // Small delay between orders to avoid rate limits
+        await this.sleep(100);
+        
+        // Create SECOND sell order at averaged price (for the new order's qty)
+        this.log(`Creating SELL TP #2 at ${avgSellPrice} for ${qty2}`, 'success');
+        const orderId2 = await this.placeLimitOrder('Sell', avgSellPrice, qty2);
+        if (orderId2) {
+          this.stats.totalSellOrdersCreated++;
+          this.activeSellTPOrders.push({ 
+            orderId: orderId2, 
+            price: avgSellPrice, 
+            qty: qty2, 
+            buyPrice: buyPrice,  // Keep original buy price for accurate profit calc
+            timestamp: Date.now(),
+            isAveraged: true
+          });
+          this.stats.pendingPositions.push({ 
+            orderId: orderId2, 
+            buyPrice: buyPrice, 
+            qty: qty2, 
+            sellPrice: avgSellPrice 
+          });
+        }
+        
+        // Re-sort after adding both orders
+        this.sortTPOrdersByPrice();
+        return;
+        
+      } else {
+        // Conditions not met for averaging
+        if (tickDiff < 100 && tickDiff > 0) {
+          this.log(`📊 NO AVERAGE: Diff=${tickDiff} ticks < 100, creating normal TP`, 'info');
+        } else if (tickDiff <= 0) {
+          this.log(`📊 NO AVERAGE: New price (${plannedTPPrice}) >= highest (${highestExisting.price}), creating normal TP`, 'info');
+        }
+      }
+    }
+    
+    // Create normal TP order (no averaging)
+    this.log(`Creating SELL TP at ${plannedTPPrice} for ${qty}`, 'success');
+
+    const orderId = await this.placeLimitOrder('Sell', plannedTPPrice, qty);
     if (orderId) {
       this.stats.totalSellOrdersCreated++;
       
       // Add to array and re-sort to maintain price order
-      this.activeSellTPOrders.push({ orderId, price: tpPrice, qty, buyPrice, timestamp: Date.now() });
+      this.activeSellTPOrders.push({ 
+        orderId, 
+        price: plannedTPPrice, 
+        qty, 
+        buyPrice, 
+        timestamp: Date.now() 
+      });
       this.sortTPOrdersByPrice();
       
-      this.stats.pendingPositions.push({ orderId, buyPrice, qty, sellPrice: tpPrice });
+      this.stats.pendingPositions.push({ orderId, buyPrice, qty, sellPrice: plannedTPPrice });
     }
   }
 
